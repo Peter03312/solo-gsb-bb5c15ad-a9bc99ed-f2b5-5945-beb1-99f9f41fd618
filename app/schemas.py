@@ -472,5 +472,47 @@ class ObservationEventPage(_UTCDatetimeModel):
     next_cursor: int | None
 
 
+class RegionChangeOperationOut(BaseModel):
+    """批量变更摘要中的单个操作（与成功响应 operations 元素一致）。"""
+
+    index: int
+    action: str
+    region_id: int
+    version: int | None = None
+
+
+class RegionChangeBatchSummary(BaseModel):
+    """批量变更摘要：操作总数、按类型计数与逐操作结果（按数组顺序）。"""
+
+    total: int
+    create_count: int
+    update_count: int
+    delete_count: int
+    operations: list[RegionChangeOperationOut]
+
+
+class RegionChangeOut(_UTCDatetimeModel):
+    """区域集合变更历史中的一条记录（一次成功提交的区域写入）。
+
+    change_type 为 create/update/delete（单区）或 batch（批量变更）；
+    region_ids 为本次变更涉及的区域编号（批量按操作数组顺序）；
+    summary 仅批量变更非空，单区变更恒为 null。
+    """
+
+    revision: int
+    change_type: str
+    region_ids: list[int]
+    summary: RegionChangeBatchSummary | None = None
+    occurred_at: datetime
+
+
+class RegionChangePage(_UTCDatetimeModel):
+    """区域集合变更历史分页：按全局 revision 升序；
+    next_cursor 为下一页游标（末页为 null）。"""
+
+    changes: list[RegionChangeOut]
+    next_cursor: int | None
+
+
 class ErrorOut(BaseModel):
     error: dict

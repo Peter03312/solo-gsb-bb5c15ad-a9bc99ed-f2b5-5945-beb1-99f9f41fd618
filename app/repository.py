@@ -150,6 +150,53 @@ def bump_revision(cur) -> int:
     return cur.fetchone()["revision"]
 
 
+def record_region_change(
+    cur,
+    revision: int,
+    change_type: str,
+    region_ids: list[int],
+    summary: dict | None = None,
+) -> None:
+    """在区域写事务内追加一条变更审计记录（与业务变更同一事务提交）。
+
+    仅在成功提交的写路径（单区登记/修订/删除、批量变更）上调用：
+    事务回滚时审计行一并消失；幂等重试只读回放、不会再次调用。
+    summary 仅批量变更非 None（单区变更恒为 NULL）。
+    """
+    cur.execute(
+        """
+        INSERT INTO region_changes (revision, change_type, region_ids, summary)
+        VALUES (%(revision)s, %(change_type)s, %(region_ids)s, %(summary)s::jsonb)
+        """,
+        {
+            "revision": revision,
+            "change_type": change_type,
+            "region_ids": region_ids,
+            "summary": json.dumps(summary, ensure_ascii=False)
+            if summary is not None else None,
+        },
+    )
+
+
+def build_batch_summary(public_ops: list[dict]) -> dict:
+    """根据批量变更的逐操作结果构造审计摘要（与成功响应 operations 一致）。"""
+    return {
+        "total": len(public_ops),
+        "create_count": sum(1 for op in public_ops if op["action"] == "create"),
+        "update_count": sum(1 for op in public_ops if op["action"] == "update"),
+        "delete_count": sum(1 for op in public_ops if op["action"] == "delete"),
+        "operations": [
+            {
+                "index": op["index"],
+                "action": op["action"],
+                "region_id": op["region_id"],
+                "version": op["version"],
+            }
+            for op in public_ops
+        ],
+    }
+
+
 def create_region(cur, payload, polygon_vertices: list[list[float]]) -> tuple[dict, int]:
     from shapely.geometry import Polygon
 
@@ -192,6 +239,8 @@ def create_region(cur, payload, polygon_vertices: list[list[float]]) -> tuple[di
     row = cur.fetchone()
     revision = bump_revision(cur)
     record_observation_flips(cur, current_regions, candidate, revision, now)
+    # 审计记录与区域写入同一事务提交
+    record_region_change(cur, revision, "create", [int(row["id"])])
     return _row_to_region(row), revision
 
 
@@ -291,6 +340,8 @@ def update_region(cur, region_id: int, payload, new_polygon) -> tuple[dict, int]
     updated = _row_to_region(cur.fetchone())
     revision = bump_revision(cur)
     record_observation_flips(cur, current_regions, candidate, revision, now)
+    # 审计记录与区域写入同一事务提交
+    record_region_change(cur, revision, "update", [region_id])
     return updated, revision
 
 
@@ -322,6 +373,8 @@ def delete_region(cur, region_id: int) -> tuple[bool, int | None]:
     cur.execute("DELETE FROM regions WHERE id = %s", (region_id,))
     revision = bump_revision(cur)
     record_observation_flips(cur, before_regions, current_regions, revision, now)
+    # 审计记录与区域删除同一事务提交
+    record_region_change(cur, revision, "delete", [region_id])
     return True, revision
 
 
@@ -639,6 +692,14 @@ def apply_batch(cur, payload, trajectories: list[list[tuple[float, float, float]
         {k: v for k, v in op.items() if not k.startswith("_")}
         for op in op_results
     ]
+    # 整批只留一条审计记录：摘要携带逐操作结果与按类型计数（同一事务提交）
+    record_region_change(
+        cur,
+        new_revision,
+        "batch",
+        [int(op["region_id"]) for op in public_ops],
+        build_batch_summary(public_ops),
+    )
     return {
         "revision": new_revision,
         "operations": public_ops,
@@ -1135,6 +1196,33 @@ def list_observation_events(
         LIMIT %s
         """,
         (observation_id, after_seq, limit + 1),
+    )
+    rows = cur.fetchall()
+    has_more = len(rows) > limit
+    return rows[:limit], has_more
+
+
+# ---------------------------------------------------------------- 区域变更审计历史
+
+def list_region_changes(
+    cur, after_revision: int, limit: int
+) -> tuple[list[dict], bool]:
+    """按全局 revision 游标升序读取区域集合变更历史。
+
+    返回 (changes, has_more)：取 revision > after_revision 的至多 limit+1 行，
+    多取的一行仅用于判定是否还有下一页。查询在调用方开启的
+    REPEATABLE READ 只读事务快照上完成，分页期间新提交的变更不会造成
+    重复或遗漏；下一页携带上一页返回的 next_cursor 继续读取新快照。
+    """
+    cur.execute(
+        """
+        SELECT revision, change_type, region_ids, summary, created_at
+        FROM region_changes
+        WHERE revision > %s
+        ORDER BY revision ASC
+        LIMIT %s
+        """,
+        (after_revision, limit + 1),
     )
     rows = cur.fetchall()
     has_more = len(rows) > limit

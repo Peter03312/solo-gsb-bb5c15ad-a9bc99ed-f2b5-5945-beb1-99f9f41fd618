@@ -37,6 +37,7 @@ from .schemas import (
     PassOut,
     RegionBatchRequest,
     RegionBatchResponse,
+    RegionChangePage,
     RegionCreate,
     RegionCreatedResponse,
     RegionOut,
@@ -62,8 +63,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.6.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
+    version="1.7.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试；提供按全局 revision 升序游标分页的区域集合变更只读审计历史 GET /api/region-changes（与区域写入同一事务提交，失败/重试/凭证与观察取消均不留记录）。",
     lifespan=lifespan,
 )
 
@@ -1064,8 +1065,76 @@ def get_observation_events(
     return view
 
 
-# ---------------------------------------------------------------- 轨迹核验
+# ---------------------------------------------------------------- 区域集合变更审计历史
 
+REGION_CHANGE_PAGE_MAX = 500
+
+
+def _region_change_row_to_view(row: dict) -> dict:
+    """把 region_changes 行转成审计历史输出。"""
+    return {
+        "revision": row["revision"],
+        "change_type": row["change_type"],
+        "region_ids": [int(rid) for rid in row["region_ids"]],
+        "summary": row["summary"],
+        "occurred_at": row["created_at"],
+    }
+
+
+@app.get("/api/region-changes", response_model=RegionChangePage,
+         tags=["regions"])
+def list_region_changes(
+    cursor: int = Query(
+        default=0, ge=0,
+        description="全局 revision 游标：只返回 revision 严格大于该游标的变更；"
+                    "首页传 0 或省略（不可为负）",
+    ),
+    limit: int = Query(
+        default=100, ge=1, le=REGION_CHANGE_PAGE_MAX,
+        description="每页记录数（1~500，默认 100）",
+    ),
+):
+    """为安全员提供**只读**的区域集合变更审计历史，按全局 `revision`
+    **升序**分页。
+
+    仅包含**成功提交**的区域写入：单区登记（`create`）、修订（`update`）、
+    删除（`delete`）与批量变更（`batch`）。每条记录含：
+
+    * `revision`：本次变更之后的新全局 revision；
+    * `occurred_at`：变更发生（提交）时刻（UTC）；
+    * `change_type`：`create` / `update` / `delete` / `batch`；
+    * `region_ids`：本次变更涉及的区域编号（批量按操作数组顺序）；
+    * `summary`：批量操作摘要（`total`、`create_count`/`update_count`/
+      `delete_count` 与逐操作 `index/action/region_id/version`），单区
+      变更恒为 `null`。
+
+    审计记录与对应区域写入在**同一事务**提交：失败事务（422/404/409）随
+    回滚消失、不留记录；幂等重试只回放原响应、不新增记录；凭证/承诺/观察
+    的签发、取消与观察登记都不产生区域变更记录。
+
+    整个查询在 `REPEATABLE READ READ ONLY` 事务的同一快照上完成，查询期间
+    新提交的变更不会造成本页重复或遗漏；下一页携带上一页的 `next_cursor`
+    即可读到后续新记录。无记录时返回空数组与 `next_cursor: null`；
+    `cursor<0` 或 `limit` 越界返回统一的 **422** `validation_error`。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                rows, has_more = repository.list_region_changes(cur, cursor, limit)
+                changes = [_region_change_row_to_view(r) for r in rows]
+                next_cursor = rows[-1]["revision"] if has_more and rows else None
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return {"changes": changes, "next_cursor": next_cursor}
+
+
+# ---------------------------------------------------------------- 轨迹核验
 @app.post("/api/verify", response_model=VerifyResponse, tags=["verification"])
 def verify(payload: VerifyRequest):
     """对整段连续轨迹核验。
@@ -1183,6 +1252,7 @@ def root():
             "POST /api/regions", "GET /api/regions", "GET /api/regions/{id}",
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
             "POST /api/regions/batch",
+            "GET /api/region-changes",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
             "POST /api/passes", "GET /api/passes/{id}",
             "POST /api/passes/{id}/cancel",

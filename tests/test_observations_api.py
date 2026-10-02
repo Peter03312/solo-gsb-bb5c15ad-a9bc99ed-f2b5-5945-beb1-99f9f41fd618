@@ -56,7 +56,7 @@ def reset_all():
         with conn.cursor() as cur:
             cur.execute(
                 "TRUNCATE observation_events, observations, idempotency_keys, "
-                "commitments, passes, regions RESTART IDENTITY"
+                "commitments, passes, region_changes, regions RESTART IDENTITY"
             )
             cur.execute("UPDATE region_meta SET revision = 0 WHERE id = 1")
         conn.commit()

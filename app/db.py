@@ -141,6 +141,30 @@ CREATE TABLE IF NOT EXISTS observation_events (
 CREATE INDEX IF NOT EXISTS idx_observation_events_obs_seq
     ON observation_events (observation_id, seq);
 
+-- 区域集合变更审计历史：每条记录对应一次成功提交的区域写入
+-- （单区登记/修订/删除/批量变更），与业务变更在同一事务提交；
+-- revision 即该次变更后的新全局 revision，全局唯一、单调递增，
+-- 查询按 revision 升序游标分页。summary 仅批量变更非空。
+CREATE TABLE IF NOT EXISTS region_changes (
+    id           BIGSERIAL PRIMARY KEY,
+    revision     BIGINT NOT NULL,
+    change_type  TEXT NOT NULL,
+    -- 本次变更涉及的区域编号（批量按操作数组顺序）
+    region_ids   BIGINT[] NOT NULL,
+    -- 批量操作摘要（total/各类计数/逐操作结果）；单区变更为 NULL
+    summary      JSONB,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT region_changes_type_check
+        CHECK (change_type IN ('create', 'update', 'delete', 'batch')),
+    -- 仅批量变更携带摘要，单区登记/修订/删除摘要恒为 NULL
+    CONSTRAINT region_changes_summary_check
+        CHECK ((change_type = 'batch') = (summary IS NOT NULL)),
+    CONSTRAINT region_changes_revision_unique UNIQUE (revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_region_changes_revision
+    ON region_changes (revision);
+
 -- 幂等键：区域写操作（登记/修订/删除/批量变更）的网络超时安全重试。
 -- 占位行与业务变更、响应回填在同一事务提交，因此已提交的行必然带有
 -- 完整的原 HTTP 状态码与响应体；业务失败回滚时占位行一并消失（不占键）

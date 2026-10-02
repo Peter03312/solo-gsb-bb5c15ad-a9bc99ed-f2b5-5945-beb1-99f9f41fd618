@@ -66,6 +66,7 @@ with db.pool.connection() as conn:
     with conn.cursor() as cur:
         cur.execute("TRUNCATE passes RESTART IDENTITY")
         cur.execute("TRUNCATE regions RESTART IDENTITY")
+        cur.execute("TRUNCATE region_changes RESTART IDENTITY")
         cur.execute("UPDATE region_meta SET revision = 0 WHERE id = 1")
     conn.commit()
 
