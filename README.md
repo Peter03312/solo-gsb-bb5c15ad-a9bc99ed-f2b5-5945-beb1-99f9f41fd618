@@ -17,7 +17,7 @@
 编号、当前安全结论与区域 revision；单区及批量区域变更成功时，对未取消且
 末点未过的观察比较变更前后安全结论，**仅结论翻转**才在**同一事务**留一条
 含观察编号、旧/新结论与新 revision 的事件（整批至多一条/观察）；观察
-**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。
+**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。**每次成功的区域集合变更**（单区登记/修订/删除与批量变更）还会在**同一事务**追加一条**只读审计记录**（revision、发生时间、变更类型、涉及区域编号与批量操作摘要），安全员可按全局 revision 游标升序分页读取。
 
 ## 核验规则
 
@@ -232,6 +232,86 @@ curl http://localhost:8000/api/commitments/1
 curl -X POST http://localhost:8000/api/commitments/1/cancel
 ```
 
+## 区域集合变更审计历史（只读）
+
+每次**成功提交**的区域写事务都在**同一事务**追加一条审计记录，安全员可
+按全局 revision 游标**升序分页只读**（`GET /api/regions/changes`），
+用于回看区域集合何时、以何种方式发生过变更：
+
+* **记录范围**：成功的单区**登记**（`create`）、**修订**（`update`）、
+  **删除**（`delete`）与**批量变更**（`batch`，整批一行、revision 只算
+  一次）。每条含 `revision`（变更后的全局版本号，也是分页游标）、
+  `occurred_at`（发生时间，UTC）、`change_type`、`region_ids`（本次涉及
+  的区域编号；批量按请求操作顺序，create 为新分配编号）与 `summary`
+  （批量操作摘要：逐操作 `index/action/region_id/version` 与
+  `total`、`create_count`/`update_count`/`delete_count`；单区变更同样
+  返回该结构，恰有一项 `index=0` 的操作，delete 的 `version` 为删除前
+  版本）。
+* **不留记录的情形**：失败事务（422/404/409，含校验失败、区域不存在、
+  revision 冲突、`pass_conflict`、`commitment_conflict`、轨迹不安全等）
+  整笔回滚，审计行一并消失；携带 `Idempotency-Key` 的重试只回放首次响应，
+  **不新增记录**；通行凭证、择时承诺、安全状态观察的签发与取消**不产生**
+  区域变更记录，也不推进 revision。
+* **游标分页**：`cursor` 为非负 revision 游标（默认 `0`，可省略），只返回
+  `revision` 严格大于游标的记录；`limit` 为每页条数（1~500，默认 100）。
+  响应为 `changes` 数组与 `next_cursor`（本页最后一条记录的 revision，
+  没有更多时为 `null`）；下一页携带 `?cursor=<next_cursor>` 继续。
+  从无变更或游标超出最大 revision 时返回 `"changes": []`、
+  `"next_cursor": null`。`cursor<0`、非整数、`limit` 越界（<1 或 >500）
+  一律返回 **422** `validation_error`（统一校验错误信封）。
+* **一致性**：查询在单个 `REPEATABLE READ READ ONLY` 事务内按 revision
+  键集读取；每次成功变更的 revision 单调递增且一行一 revision，因此查询
+  期间即使有新变更提交，已取页与后续页也不会重复或遗漏（新提交只会出现在
+  后续翻页/重新全量遍历时）。
+
+```bash
+# 首页（可省略 cursor）
+curl 'http://localhost:8000/api/regions/changes?limit=100&cursor=0'
+# 用 next_cursor 翻下一页
+curl 'http://localhost:8000/api/regions/changes?limit=100&cursor=3'
+```
+
+响应示例：
+
+```json
+{
+  "changes": [
+    {
+      "revision": 1,
+      "occurred_at": "2026-10-02T11:25:31.555133Z",
+      "change_type": "create",
+      "region_ids": [1],
+      "summary": {
+        "operations": [
+          {"index": 0, "action": "create", "region_id": 1, "version": 1}
+        ],
+        "total": 1,
+        "create_count": 1,
+        "update_count": 0,
+        "delete_count": 0
+      }
+    },
+    {
+      "revision": 3,
+      "occurred_at": "2026-10-02T11:25:31.881347Z",
+      "change_type": "batch",
+      "region_ids": [2, 1],
+      "summary": {
+        "operations": [
+          {"index": 0, "action": "create", "region_id": 2, "version": 1},
+          {"index": 1, "action": "delete", "region_id": 1, "version": 2}
+        ],
+        "total": 2,
+        "create_count": 1,
+        "update_count": 0,
+        "delete_count": 1
+      }
+    }
+  ],
+  "next_cursor": null
+}
+```
+
 ## 幂等重试规则（`Idempotency-Key` 请求头）
 
 安全员在**网络超时**后需要重试区域变更时，可以为以下四个写接口携带
@@ -323,7 +403,7 @@ docker compose up --build
 
 首次启动时应用会自动建表（`regions`、`region_meta`、`passes`、
 `commitments`、`observations`、`observation_events`、
-`idempotency_keys`）并初始化全局版本号，无需手工执行 SQL。数据库未就绪时应用会自动重试连接
+`idempotency_keys`、`region_change_audit`）并初始化全局版本号，无需手工执行 SQL。数据库未就绪时应用会自动重试连接
 （默认 30 次、间隔 1 秒）。
 
 停止并清理数据卷：
@@ -368,6 +448,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | PATCH | `/api/regions/{id}` | 修订区域（字段任意组合，部分更新）；`version` +1；支持幂等键 |
 | DELETE | `/api/regions/{id}` | 删除区域；支持幂等键 |
 | POST | `/api/regions/batch` | 多处区域登记/修订/删除一次原子提交，并核验指定轨迹全部安全；支持幂等键 |
+| GET | `/api/regions/changes` | 区域集合变更只读审计历史：按全局 revision 游标升序分页 |
 | GET | `/api/revision` | 当前区域集合全局版本号（任意写操作后单调 +1） |
 | POST | `/api/verify` | 对一条绝对时刻轨迹做整段穿越核验 |
 | POST | `/api/schedule` | 对一条相对秒数固定行程，求候选时段内全部安全出发区间 |
@@ -888,6 +969,10 @@ bash examples/curl_observations.sh
 # 非法键 422、失败不占键、带键删除/批量重试）
 bash examples/curl_idempotency.sh
 
+# 区域集合变更只读审计历史（登记/修订/删除/批量各一条；失败与幂等重试
+# 不留记录；revision 游标升序分页、next_cursor、游标非法 422）
+bash examples/curl_region_changes.sh
+
 # 仅用 Python 标准库的调用示例（含调度两段安全区间与通行凭证演示）
 python3 examples/python_client.py
 ```
@@ -926,18 +1011,24 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 整批至多一条/观察、失败回滚与幂等回放不重复产生事件、取消与过期不产生
 # 事件、事件游标分页、观察不影响凭证/承诺保护，会清空全部业务表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_observations_api.py
+
+# 区域集合变更审计历史 API 集成测试（四类变更各一条同事务记录、字段与
+# 批量摘要正确、失败事务/幂等重试/凭证承诺观察签发取消均不留记录、
+# 游标分页不重不漏、游标非法 422、并发写与查询期间新增不重不漏，
+# 会清空全部业务表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_region_changes_api.py
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes、commitments、observations、幂等键）
-  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、观察与事件分页模型）
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes、commitments、observations、区域变更审计历史、幂等键）
+  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、观察与事件分页模型、区域变更审计分页模型）
   geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差）
-  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证/择时承诺/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件、幂等键占位/回放
-  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments/observations/observation_events/idempotency_keys）、启动重试
-examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺、安全状态观察与幂等重试）
-tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/安全状态观察/幂等键集成测试
+  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证/择时承诺/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件与区域变更审计追加、幂等键占位/回放
+  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments/observations/observation_events/idempotency_keys/region_change_audit）、启动重试
+examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺、安全状态观察、区域集合变更审计历史与幂等重试）
+tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/安全状态观察/区域变更审计历史/幂等键集成测试
 Dockerfile, docker-compose.yml
 ```

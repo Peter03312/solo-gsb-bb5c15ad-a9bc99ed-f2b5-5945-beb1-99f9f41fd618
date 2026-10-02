@@ -153,6 +153,23 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     response_body TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 区域集合变更审计历史：每个成功的区域写事务（单区登记/修订/删除与批量
+-- 变更）在同一事务恰好追加一行，revision 即该次变更后的全局版本号（主键
+-- 保证一次变更一条）。失败回滚的事务不产生行；幂等重试回放不重新执行写
+-- 路径，也不会追加；凭证/承诺/观察的签发与取消不写本表。
+-- change_type: create/update/delete（单区）或 batch（批量变更，整批一行）；
+-- region_ids 为本次涉及的区域编号（批量按请求操作顺序，create 为新分配 id）；
+-- summary 为操作摘要 JSON（逐操作 action/region_id/version 与各类型计数）。
+CREATE TABLE IF NOT EXISTS region_change_audit (
+    revision    BIGINT PRIMARY KEY,
+    change_type TEXT NOT NULL,
+    region_ids  BIGINT[] NOT NULL,
+    summary     JSONB NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT region_change_audit_type_check
+        CHECK (change_type IN ('create', 'update', 'delete', 'batch'))
+);
 """
 
 

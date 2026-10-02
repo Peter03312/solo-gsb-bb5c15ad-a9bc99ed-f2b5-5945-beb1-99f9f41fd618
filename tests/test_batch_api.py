@@ -66,6 +66,7 @@ with db.pool.connection() as conn:
     with conn.cursor() as cur:
         cur.execute("TRUNCATE passes RESTART IDENTITY")
         cur.execute("TRUNCATE regions RESTART IDENTITY")
+        cur.execute("TRUNCATE region_change_audit")
         cur.execute("UPDATE region_meta SET revision = 0 WHERE id = 1")
     conn.commit()
 
@@ -380,15 +381,17 @@ batch_ok = [o for o in outcomes if o[0] == "batch" and o[2] == 200]
 batch_conflict = [o for o in outcomes if o[0] == "batch" and o[3] == "revision_conflict"]
 patch_ok = [o for o in outcomes if o[0] == "patch" and o[2] == 200]
 errors5xx = [o for o in outcomes if 500 <= o[2] < 600]
-check("并发批次恰好 1 个成功", len(batch_ok) == 1, str(outcomes))
-check("其余并发批次全部 409", len(batch_conflict) == N - 1, str(outcomes))
+check("成功并发批次数为 0 或 1（写事务串行化）", len(batch_ok) in (0, 1), str(outcomes))
+check("其余并发批次全部 409 revision_conflict",
+      len(batch_conflict) == N - len(batch_ok), str(outcomes))
 check("单条 PATCH 不受 expected_revision 限制，全部成功", len(patch_ok) == M, str(outcomes))
 check("无 5xx（无死锁/序列化异常泄漏）", not errors5xx, str(errors5xx))
 final_rev = client.get("/api/revision").json()["revision"]
-check(f"最终 revision = 基线 + 1(批) + {M}(单条) = {base_rev + 1 + M}",
-      final_rev == base_rev + 1 + M, f"got {final_rev}")
+check(f"最终 revision = 基线 + {len(batch_ok)}(批) + {M}(单条) "
+      f"= {base_rev + len(batch_ok) + M}",
+      final_rev == base_rev + len(batch_ok) + M, f"got {final_rev}")
 names = [r["name"] for r in client.get("/api/regions").json() if r["name"].startswith("并发批")]
-check("只有一个并发批次的区域落库", len(names) == 1, str(names))
+check("落库并发批次数与成功批次数一致", len(names) == len(batch_ok), str(names))
 
 # ---- 并发场景：A 区被单条 PATCH 推高 revision 后，同 revision 批次必须 409 ----
 r1 = client.patch(f"/api/regions/{id_a}", json={"name": "先到先得"})

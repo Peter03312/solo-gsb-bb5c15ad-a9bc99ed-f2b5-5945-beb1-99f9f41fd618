@@ -37,6 +37,7 @@ from .schemas import (
     PassOut,
     RegionBatchRequest,
     RegionBatchResponse,
+    RegionChangePage,
     RegionCreate,
     RegionCreatedResponse,
     RegionOut,
@@ -62,8 +63,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.6.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
+    version="1.7.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试。",
     lifespan=lifespan,
 )
 
@@ -489,6 +490,65 @@ def list_regions():
             repository.configure_cursor(cur)
             rows = repository.list_regions(cur)
     return [RegionOut.model_validate(r) for r in rows]
+
+
+REGION_CHANGE_PAGE_MAX = 500
+
+
+@app.get("/api/regions/changes", response_model=RegionChangePage, tags=["regions"])
+def list_region_changes(
+    cursor: int = Query(
+        default=0, ge=0,
+        description="全局 revision 游标：只返回 revision 严格大于该游标的变更记录；"
+                    "首页传 0 或不传（不可为负）",
+    ),
+    limit: int = Query(
+        default=100, ge=1, le=REGION_CHANGE_PAGE_MAX,
+        description="每页记录数（1~500，默认 100）",
+    ),
+):
+    """区域集合变更的**只读审计历史**：按全局 revision 升序分页。
+
+    仅包含**成功提交**的区域写事务——单区登记（`create`）、修订
+    （`update`）、删除（`delete`）与批量变更（`batch`，整批一行）；
+    每条记录含 `revision`、`occurred_at`（发生时间）、`change_type`、
+    `region_ids`（涉及区域编号，批量按请求操作顺序）与 `summary`
+    （批量操作摘要：逐操作 action/region_id/version 及各类型计数）。
+
+    失败事务（422/404/409）随回滚不留记录；幂等重试只回放原响应、不新增
+    记录；通行凭证、择时承诺与安全状态观察的签发/取消不产生区域变更记录。
+
+    查询在 `REPEATABLE READ READ ONLY` 快照中完成，游标为严格大于的
+    revision 键集分页：查询期间有新变更提交也不会造成重复或遗漏。
+    `next_cursor` 为本页最后一条记录的 revision，无更多记录时为 `null`；
+    从无变更时返回空数组 `changes: []` 与 `next_cursor: null`。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                rows, has_more = repository.list_region_changes(cur, cursor, limit)
+                page = {
+                    "changes": [
+                        {
+                            "revision": r["revision"],
+                            "occurred_at": r["occurred_at"],
+                            "change_type": r["change_type"],
+                            "region_ids": r["region_ids"],
+                            "summary": r["summary"],
+                        }
+                        for r in rows
+                    ],
+                    "next_cursor": rows[-1]["revision"] if has_more and rows else None,
+                }
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return page
 
 
 @app.get("/api/regions/{region_id}", response_model=RegionOut, tags=["regions"])
@@ -1183,6 +1243,7 @@ def root():
             "POST /api/regions", "GET /api/regions", "GET /api/regions/{id}",
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
             "POST /api/regions/batch",
+            "GET /api/regions/changes",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
             "POST /api/passes", "GET /api/passes/{id}",
             "POST /api/passes/{id}/cancel",

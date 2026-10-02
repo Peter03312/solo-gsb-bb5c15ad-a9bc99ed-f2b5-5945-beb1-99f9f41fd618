@@ -472,5 +472,49 @@ class ObservationEventPage(_UTCDatetimeModel):
     next_cursor: int | None
 
 
+# ---------------------------------------------------------------- 区域集合变更审计
+
+class RegionChangeOperationOut(BaseModel):
+    """审计摘要中的单个操作（单区变更时恰有一项 index=0）。"""
+
+    index: int
+    action: str
+    region_id: int
+    version: int | None = None
+
+
+class RegionChangeSummaryOut(BaseModel):
+    """批量操作摘要：逐操作（保留请求下标）与各类型操作计数。"""
+
+    operations: list[RegionChangeOperationOut]
+    total: int
+    create_count: int
+    update_count: int
+    delete_count: int
+
+
+class RegionChangeOut(_UTCDatetimeModel):
+    """一条区域集合变更审计记录（对应一次成功提交的区域写事务）。
+
+    revision 为变更后的全局版本号，全库一条变更恰好一行；
+    change_type 为 create/update/delete（单区）或 batch（批量变更，整批一行）；
+    region_ids 为本次涉及的区域编号（批量按请求操作顺序，create 为新 id）；
+    summary 为批量操作摘要（逐操作与类型计数，单区变更同样返回）。
+    """
+
+    revision: int
+    occurred_at: datetime
+    change_type: str
+    region_ids: list[int]
+    summary: RegionChangeSummaryOut
+
+
+class RegionChangePage(_UTCDatetimeModel):
+    """区域集合变更审计分页结果：按 revision 升序；末页 next_cursor 为 null。"""
+
+    changes: list[RegionChangeOut]
+    next_cursor: int | None
+
+
 class ErrorOut(BaseModel):
     error: dict

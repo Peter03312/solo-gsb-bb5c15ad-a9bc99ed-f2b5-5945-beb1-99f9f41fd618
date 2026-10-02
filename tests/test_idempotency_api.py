@@ -53,6 +53,7 @@ def reset_all():
             cur.execute("TRUNCATE passes RESTART IDENTITY")
             cur.execute("TRUNCATE regions RESTART IDENTITY")
             cur.execute("TRUNCATE idempotency_keys")
+            cur.execute("TRUNCATE region_change_audit")
             cur.execute("UPDATE region_meta SET revision = 0 WHERE id = 1")
         conn.commit()
 

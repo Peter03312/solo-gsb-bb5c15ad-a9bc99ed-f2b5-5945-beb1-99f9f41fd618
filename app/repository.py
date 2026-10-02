@@ -192,6 +192,11 @@ def create_region(cur, payload, polygon_vertices: list[list[float]]) -> tuple[di
     row = cur.fetchone()
     revision = bump_revision(cur)
     record_observation_flips(cur, current_regions, candidate, revision, now)
+    # 审计记录与区域写入、revision 推进、观察事件同一事务提交
+    record_region_change(
+        cur, revision, "create", [row["id"]],
+        _single_change_summary("create", row["id"], row["version"]),
+    )
     return _row_to_region(row), revision
 
 
@@ -291,6 +296,11 @@ def update_region(cur, region_id: int, payload, new_polygon) -> tuple[dict, int]
     updated = _row_to_region(cur.fetchone())
     revision = bump_revision(cur)
     record_observation_flips(cur, current_regions, candidate, revision, now)
+    # 审计记录与区域写入、revision 推进、观察事件同一事务提交
+    record_region_change(
+        cur, revision, "update", [region_id],
+        _single_change_summary("update", region_id, updated["version"]),
+    )
     return updated, revision
 
 
@@ -299,7 +309,7 @@ def delete_region(cur, region_id: int) -> tuple[bool, int | None]:
     get_revision(cur)
     cur.execute(
         """
-        SELECT id FROM regions WHERE id = %s
+        SELECT id, version FROM regions WHERE id = %s
         FOR UPDATE
         """,
         (region_id,),
@@ -307,6 +317,7 @@ def delete_region(cur, region_id: int) -> tuple[bool, int | None]:
     existing = cur.fetchone()
     if existing is None:
         return False, None
+    deleted_version = int(existing["version"])
     # 变更后的完整集合（移除该区域）必须仍保证未取消且未结束的凭证安全；
     # 删除只会扩大安全集合，承诺不可能被破坏，但仍沿用同一检查契约
     all_current = _load_all_regions_locked(cur)
@@ -322,6 +333,11 @@ def delete_region(cur, region_id: int) -> tuple[bool, int | None]:
     cur.execute("DELETE FROM regions WHERE id = %s", (region_id,))
     revision = bump_revision(cur)
     record_observation_flips(cur, before_regions, current_regions, revision, now)
+    # 审计记录与删除、revision 推进、观察事件同一事务提交（含删除前 version）
+    record_region_change(
+        cur, revision, "delete", [region_id],
+        _single_change_summary("delete", region_id, deleted_version),
+    )
     return True, revision
 
 
@@ -639,11 +655,108 @@ def apply_batch(cur, payload, trajectories: list[list[tuple[float, float, float]
         {k: v for k, v in op.items() if not k.startswith("_")}
         for op in op_results
     ]
+    # 整批只有一行审计：涉及区域编号按请求操作顺序，摘要为逐操作与类型计数。
+    # 与整批落库、revision 推进、观察事件同一事务提交（失败回滚则一并消失）
+    record_region_change(
+        cur,
+        new_revision,
+        "batch",
+        [op["region_id"] for op in public_ops],
+        _batch_change_summary(public_ops),
+    )
     return {
         "revision": new_revision,
         "operations": public_ops,
         "trajectory_results": all_checks,
     }
+
+
+# ---------------------------------------------------------------- 区域集合变更审计
+
+def record_region_change(
+    cur,
+    revision: int,
+    change_type: str,
+    region_ids: list[int],
+    summary: dict,
+) -> None:
+    """在区域写事务内追加一条集合变更审计记录（与区域写入同一事务提交）。
+
+    revision 为本次变更后的全局版本号；主键保证一次成功变更恰好一行。
+    调用方事务回滚（校验/冲突失败）时审计行一并回滚；幂等重试只回放已
+    提交响应、不会再次进入写路径，因此也不会重复追加。
+    """
+    cur.execute(
+        """
+        INSERT INTO region_change_audit
+            (revision, change_type, region_ids, summary)
+        VALUES (%s, %s, %s, %s::jsonb)
+        """,
+        (revision, change_type, region_ids, json.dumps(summary)),
+    )
+
+
+def _single_change_summary(
+    action: str, region_id: int, version: int
+) -> dict:
+    """单区登记/修订/删除的批量操作风格摘要。"""
+    counts = {"create": 0, "update": 0, "delete": 0}
+    counts[action] = 1
+    return {
+        "operations": [
+            {"index": 0, "action": action, "region_id": region_id, "version": version}
+        ],
+        "total": 1,
+        "create_count": counts["create"],
+        "update_count": counts["update"],
+        "delete_count": counts["delete"],
+    }
+
+
+def _batch_change_summary(public_ops: list[dict]) -> dict:
+    """批量变更摘要：逐操作（保留请求下标）与各类型操作计数。"""
+    counts = {"create": 0, "update": 0, "delete": 0}
+    for op in public_ops:
+        counts[op["action"]] += 1
+    return {
+        "operations": [
+            {
+                "index": op["index"],
+                "action": op["action"],
+                "region_id": op["region_id"],
+                "version": op.get("version"),
+            }
+            for op in public_ops
+        ],
+        "total": len(public_ops),
+        "create_count": counts["create"],
+        "update_count": counts["update"],
+        "delete_count": counts["delete"],
+    }
+
+
+def list_region_changes(
+    cur, after_revision: int, limit: int
+) -> tuple[list[dict], bool]:
+    """按全局 revision 游标升序读取区域集合变更审计记录。
+
+    返回 (changes, has_more)：取 revision > after_revision 的至多 limit+1 行，
+    多取的一行仅用于判定是否还有下一页。revision 为单调递增且一次变更一行，
+    配合 REPEATABLE READ 只读快照，分页遍历不会重复或遗漏。
+    """
+    cur.execute(
+        """
+        SELECT revision, change_type, region_ids, summary, occurred_at
+        FROM region_change_audit
+        WHERE revision > %s
+        ORDER BY revision ASC
+        LIMIT %s
+        """,
+        (after_revision, limit + 1),
+    )
+    rows = cur.fetchall()
+    has_more = len(rows) > limit
+    return rows[:limit], has_more
 
 
 def utcnow() -> datetime:
